@@ -44,6 +44,12 @@ namespace GooglePlayStoreCrawler
         private const int AppsAmount = 1040;
         private const int ThreadsAmount = 13;
 
+        private static readonly string currentDir = Directory.GetCurrentDirectory();
+        private static readonly string jsonDir = Directory.CreateDirectory($"{currentDir}/apps_metadata").FullName;
+
+        private static readonly string jsonRatedDir =
+            Directory.CreateDirectory($"{currentDir}/rated_apps_metadata").FullName;
+
         private static readonly HttpClient httpClient = new HttpClient();
 
         private static readonly HtmlWeb htmlClient = new HtmlWeb
@@ -56,15 +62,12 @@ namespace GooglePlayStoreCrawler
         {
             var startTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-            var currentDir = Directory.GetCurrentDirectory();
-            var jsonDir = Directory.CreateDirectory($"{currentDir}/apps_metadata");
-
             var sitemapsXml = await httpClient.GetStringAsync(SitemapsUrl);
             var sitemapsDoc = new XmlDocument();
             sitemapsDoc.LoadXml(sitemapsXml);
 
             var tasks = Enumerable.Range(0, ThreadsAmount)
-                .Select(i => CrawlPlayStore(AppsAmount / ThreadsAmount, i, sitemapsDoc, jsonDir.FullName));
+                .Select(i => CrawlPlayStore(AppsAmount / ThreadsAmount, i, sitemapsDoc));
             var taskRes = await Task.WhenAll(tasks);
             var appData = taskRes.SelectMany(i => i).ToHashSet();
 
@@ -73,11 +76,11 @@ namespace GooglePlayStoreCrawler
 
             Console.WriteLine($"Fetched {appData.Count()} apps in {timeSpentForAll}ms");
 
-            Console.WriteLine($"Apps metadata stored at {jsonDir.FullName}");
+            Console.WriteLine($"Apps metadata stored at {jsonDir}");
+            Console.WriteLine($"Rated apps metadata stored at {jsonRatedDir}");
         }
 
-        private static async Task<List<AppData>> CrawlPlayStore(int urlsCount, int threadIndex, XmlDocument sitemapsDoc,
-            string jsonDirPath)
+        private static async Task<List<AppData>> CrawlPlayStore(int urlsCount, int threadIndex, XmlDocument sitemapsDoc)
         {
             Console.WriteLine($"Thread {threadIndex} started");
 
@@ -85,7 +88,7 @@ namespace GooglePlayStoreCrawler
 
             Console.WriteLine($"Thread {threadIndex} retrieved {appUrls.Count} URLs");
 
-            var appData = await FetchAppDataParallel(appUrls.ToList(), jsonDirPath);
+            var appData = await FetchAppDataParallel(appUrls.ToList());
 
             Console.WriteLine($"Thread {threadIndex} retrieved {appData.Count} pages");
 
@@ -133,7 +136,7 @@ namespace GooglePlayStoreCrawler
         }
 
 
-        private static async Task<List<AppData>> FetchAppDataParallel(List<string> urls, string jsonDirPath)
+        private static async Task<List<AppData>> FetchAppDataParallel(List<string> urls)
         {
             // this was an attempt to check if it could be faster when batching requests but it in the end it was not 
 
@@ -148,22 +151,31 @@ namespace GooglePlayStoreCrawler
             //     appData.AddRange(await Task.WhenAll(tasks));
             // }
 
-            var tasks = urls.Select(url => GetAndStoreAppData(url, jsonDirPath));
+            var tasks = urls.Select(GetAndStoreAppData);
             var appData = await Task.WhenAll(tasks);
 
             return appData.Where(res => res.Name != FetchError).ToList();
         }
 
-        private static async Task<AppData> GetAndStoreAppData(string url, string jsonDirPath)
+        private static async Task<AppData> GetAndStoreAppData(string url)
         {
             try
             {
                 var doc = await htmlClient.LoadFromWebAsync(url);
                 var data = ExtractAppData(doc, url);
 
-                await using var createStream = File.Create($"{jsonDirPath}/{data.Id}.json");
+                await using var createStream = File.Create($"{jsonDir}/{data.Id}.json");
                 await JsonSerializer.SerializeAsync(createStream, data,
                     new JsonSerializerOptions { WriteIndented = true });
+
+                // since not many retrieved apps have aggregated ratings
+                // store the ones that have them also in another dir
+                if (data.Stars > 0)
+                {
+                    await using var createStreamRated = File.Create($"{jsonRatedDir}/{data.Id}.json");
+                    await JsonSerializer.SerializeAsync(createStreamRated, data,
+                        new JsonSerializerOptions { WriteIndented = true });
+                }
 
                 return data;
             }
@@ -198,7 +210,7 @@ namespace GooglePlayStoreCrawler
                     var scriptText = scriptNode.InnerText;
                     if (!scriptText.Contains($"[\"{data.Name}\"]")) continue;
                     var match = versionRegex.Match(scriptText).Value;
-                    data.CurrentVersion = match == "" ? "N/A" : match;
+                    data.CurrentVersion = string.IsNullOrEmpty(match) ? "N/A" : match;
                     break;
                 }
                 catch (Exception e)
